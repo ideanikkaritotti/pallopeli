@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pallopeli</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><circle cx='5' cy='5' r='4' fill='%234363d8'/></svg>">
+<style>
+  html, body { margin: 0; height: 100%; background: #14161c; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+  #game { display: block; margin: 0 auto; touch-action: none; }
+  #hud { position: fixed; top: 10px; left: 12px; font-size: 14px; line-height: 1.5; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  #board { position: fixed; top: 10px; right: 12px; font-size: 14px; line-height: 1.6; text-align: right; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  #lobby { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(10,12,16,.85); }
+  .card { background: #1f232c; padding: 28px 32px; border-radius: 12px; width: min(340px, 90vw); box-shadow: 0 10px 40px #0008; }
+  .card h1 { margin: 0 0 16px; font-size: 26px; }
+  .card label { display: block; font-size: 13px; color: #aab; margin: 12px 0 4px; }
+  .card input { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; border-radius: 6px; border: 1px solid #3a4050; background: #12151b; color: #eee; }
+  .card button { margin-top: 18px; width: 100%; padding: 12px; font-size: 16px; font-weight: 600; border: 0; border-radius: 6px; background: #4363d8; color: #fff; cursor: pointer; }
+  .card button:hover { background: #5574e8; }
+  .card .hint { font-size: 12px; color: #889; margin-top: 12px; }
+  #msg { color: #f88; font-size: 14px; margin-top: 10px; min-height: 1em; }
+  #copy { position: fixed; bottom: 12px; left: 12px; padding: 8px 12px; border: 0; border-radius: 6px; background: #2b3040; color: #ddd; cursor: pointer; display: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud"></div>
+<div id="board"></div>
+<button id="copy">Kopioi huoneen linkki</button>
+
+<div id="lobby">
+  <div class="card">
+    <h1>Pallopeli</h1>
+    <label for="name">Nimesi</label>
+    <input id="name" maxlength="16" placeholder="esim. Totti">
+    <label for="room">Huone</label>
+    <input id="room" maxlength="16" placeholder="esim. testi">
+    <button id="join">Liity peliin</button>
+    <div id="msg"></div>
+    <div class="hint">Samaan huoneeseen liittyvät pelaajat näkevät toisensa. Liiku nuolilla tai WASD:llä (puhelimella: kosketa ruutua). Kerää kolikoita ja tönäise muita.</div>
+  </div>
+</div>
+
+<script>
+// ====== ASETUS: vaihda tähän oman Cloudflare-palvelimesi osoite ======
+const PROD_SERVER = "wss://pallopeli.pallopeli.workers.dev";
+// Kun peli avataan omalta koneelta, käytetään paikallista palvelinta (npx wrangler dev)
+const isLocal = ["localhost", "127.0.0.1", ""].includes(location.hostname);
+const SERVER = new URLSearchParams(location.search).get("server") || (isLocal ? "ws://localhost:8787" : PROD_SERVER);
+
+const INTERP_DELAY = 100; // ms: muita näytetään hieman menneisyydessä, jotta liike on sulavaa
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const board = document.getElementById("board");
+const lobby = document.getElementById("lobby");
+const msgEl = document.getElementById("msg");
+const nameInput = document.getElementById("name");
+const roomInput = document.getElementById("room");
+const copyBtn = document.getElementById("copy");
+
+let ws = null, myId = null, roomName = "";
+let arena = { w: 800, h: 600, r: 20, coinR: 10 };
+let snapshots = []; // [{time, players: Map, coin}]
+let status = "";
+
+// Esitäytä lomake: huone linkistä (?room=...) ja nimi edelliseltä kerralta
+const params = new URLSearchParams(location.search);
+roomInput.value = params.get("room") || "";
+try { nameInput.value = localStorage.getItem("pallopeli-nimi") || ""; } catch {}
+
+document.getElementById("join").onclick = join;
+[nameInput, roomInput].forEach((el) => el.addEventListener("keydown", (e) => { if (e.key === "Enter") join(); }));
+
+function join() {
+  const name = nameInput.value.trim() || "Pelaaja";
+  roomName = (roomInput.value.trim() || "aula").toLowerCase();
+  try { localStorage.setItem("pallopeli-nimi", name); } catch {}
+  // Päivitä osoiteriville ?room=..., jotta linkin voi jakaa kaverille
+  const u = new URL(location.href);
+  u.searchParams.set("room", roomName);
+  history.replaceState(null, "", u);
+  connect(name);
+}
+
+function connect(name) {
+  msgEl.textContent = "";
+  status = "Yhdistetään…";
+  snapshots = [];
+  ws = new WebSocket(`${SERVER}/ws?room=${encodeURIComponent(roomName)}&name=${encodeURIComponent(name)}`);
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "welcome") {
+      myId = msg.id;
+      arena = msg.arena;
+      status = "";
+      lobby.style.display = "none";
+      copyBtn.style.display = "block";
+      resize();
+    } else if (msg.type === "state") {
+      snapshots.push({ time: performance.now(), players: new Map(msg.players.map((p) => [p.id, p])), coin: msg.coin });
+      if (snapshots.length > 30) snapshots.shift();
+    } else if (msg.type === "full") {
+      msgEl.textContent = "Huone on täynnä. Kokeile toista huonetta.";
+    }
+  };
+
+  ws.onclose = () => {
+    if (lobby.style.display === "none") msgEl.textContent = "Yhteys katkesi. Liity uudelleen.";
+    else if (!msgEl.textContent) msgEl.textContent = "Palvelimeen ei saatu yhteyttä (" + SERVER + ").";
+    lobby.style.display = "flex";
+    copyBtn.style.display = "none";
+    myId = null;
+  };
+}
+
+copyBtn.onclick = async () => {
+  try { await navigator.clipboard.writeText(location.href); copyBtn.textContent = "Linkki kopioitu!"; }
+  catch { prompt("Kopioi linkki:", location.href); }
+  setTimeout(() => (copyBtn.textContent = "Kopioi huoneen linkki"), 1500);
+};
+
+// ====== Ohjaus ======
+const keys = { u: false, d: false, l: false, r: false };
+const keyMap = { ArrowUp: "u", KeyW: "u", ArrowDown: "d", KeyS: "d", ArrowLeft: "l", KeyA: "l", ArrowRight: "r", KeyD: "r" };
+let touchDir = null; // kosketusohjaus: suunta oman pallon suhteen
+
+function setKey(e, down) {
+  const k = keyMap[e.code];
+  if (!k || lobby.style.display !== "none") return;
+  e.preventDefault();
+  if (keys[k] !== down) { keys[k] = down; sendInput(); }
+}
+addEventListener("keydown", (e) => setKey(e, true));
+addEventListener("keyup", (e) => setKey(e, false));
+addEventListener("blur", () => { for (const k in keys) keys[k] = false; sendInput(); });
+
+let lastSent = "";
+function sendInput() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  let input = { ...keys };
+  if (touchDir) {
+    input = { u: touchDir.y < -0.4, d: touchDir.y > 0.4, l: touchDir.x < -0.4, r: touchDir.x > 0.4 };
+  }
+  const s = JSON.stringify({ type: "input", ...input });
+  if (s !== lastSent) { ws.send(s); lastSent = s; } // lähetetään vain muutokset
+}
+
+function updateTouch(e) {
+  const me = currentView().players.get(myId);
+  if (!me) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) / scale, sy = (e.clientY - rect.top) / scale;
+  const dx = sx - me.x, dy = sy - me.y, len = Math.hypot(dx, dy);
+  touchDir = len < arena.r ? { x: 0, y: 0 } : { x: dx / len, y: dy / len };
+  sendInput();
+}
+canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); updateTouch(e); });
+canvas.addEventListener("pointermove", (e) => { if (touchDir) updateTouch(e); });
+canvas.addEventListener("pointerup", () => { touchDir = null; sendInput(); });
+canvas.addEventListener("pointercancel", () => { touchDir = null; sendInput(); });
+
+// ====== Piirto ======
+let scale = 1;
+function resize() {
+  scale = Math.min(innerWidth / arena.w, innerHeight / arena.h);
+  const dpr = devicePixelRatio || 1;
+  canvas.style.width = arena.w * scale + "px";
+  canvas.style.height = arena.h * scale + "px";
+  canvas.style.marginTop = (innerHeight - arena.h * scale) / 2 + "px";
+  canvas.width = arena.w * scale * dpr;
+  canvas.height = arena.h * scale * dpr;
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+// Interpolointi: etsitään kaksi tilaa, joiden väliin "renderöintihetki" osuu, ja lasketaan väliltä.
+function currentView() {
+  if (snapshots.length === 0) return { players: new Map(), coin: null };
+  const renderTime = performance.now() - INTERP_DELAY;
+  let i = snapshots.length - 1;
+  while (i > 0 && snapshots[i - 1].time > renderTime) i--;
+  const b = snapshots[i], a = snapshots[i - 1];
+  if (!a || renderTime >= b.time) return b;
+  const t = Math.max(0, Math.min(1, (renderTime - a.time) / (b.time - a.time)));
+  const players = new Map();
+  for (const [id, pb] of b.players) {
+    const pa = a.players.get(id);
+    players.set(id, pa ? { ...pb, x: pa.x + (pb.x - pa.x) * t, y: pa.y + (pb.y - pa.y) * t } : pb);
+  }
+  return { players, coin: b.coin };
+}
+
+function draw() {
+  const view = currentView();
+  ctx.fillStyle = "#1b1e26";
+  ctx.fillRect(0, 0, arena.w, arena.h);
+
+  // Ruudukko
+  ctx.strokeStyle = "#252a35";
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= arena.w; x += 50) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, arena.h); ctx.stroke(); }
+  for (let y = 0; y <= arena.h; y += 50) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(arena.w, y); ctx.stroke(); }
+
+  // Kolikko
+  if (view.coin) {
+    const pulse = 1 + Math.sin(performance.now() / 200) * 0.12;
+    ctx.beginPath();
+    ctx.arc(view.coin.x, view.coin.y, arena.coinR * pulse, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffd83d";
+    ctx.fill();
+    ctx.strokeStyle = "#b8901a";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // Pelaajat
+  ctx.textAlign = "center";
+  ctx.font = "bold 13px system-ui, sans-serif";
+  for (const p of view.players.values()) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, arena.r, 0, Math.PI * 2);
+    ctx.fillStyle = p.c;
+    ctx.fill();
+    if (p.id === myId) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke(); }
+    ctx.fillStyle = "#fff";
+    const labelY = p.y - arena.r - 6 < 14 ? p.y + arena.r + 16 : p.y - arena.r - 6; // yläreunassa nimi pallon alle
+    ctx.fillText(p.n, p.x, labelY);
+  }
+
+  // Tiedot ja pistetaulu
+  const n = view.players.size;
+  hud.textContent = myId ? `Huone: ${roomName} · pelaajia ${n}` : status;
+  const sorted = [...view.players.values()].sort((a, b) => b.s - a.s);
+  board.innerHTML = sorted.map((p) =>
+    `<div><span style="color:${p.c}">●</span> ${escapeHtml(p.n)}${p.id === myId ? " (sinä)" : ""}: <b>${p.s}</b></div>`
+  ).join("");
+
+  requestAnimationFrame(draw);
+}
+function escapeHtml(s) { return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]); }
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
